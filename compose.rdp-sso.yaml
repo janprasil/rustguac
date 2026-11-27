@@ -35,7 +35,8 @@ services:
     volumes:
       - rustguac-data:/opt/rustguac/data
       - type: bind
-        source: ${AD_CA_CERT_HOST_PATH:?Mount the AD CA PEM file}
+        # Coolify rejects variables in volume sources.
+        source: /data/rustguac/ad-ca.pem
         target: /run/certs/ad-ca.pem
         read_only: true
         bind:
