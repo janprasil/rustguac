@@ -86,6 +86,18 @@ COPY static/ static/
 
 RUN cargo build --release
 
+# Standalone rustguac for the RDP SSO stack.
+FROM debian:bookworm-slim AS sso-runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 rustguac \
+    && install -d -o rustguac -g rustguac /opt/rustguac/data /opt/rustguac/recordings
+COPY --from=rust-builder /build/target/release/rustguac /usr/local/bin/rustguac
+COPY static/ /opt/rustguac/static/
+COPY deploy/rdp-sso/rustguac.toml /opt/rustguac/config.toml
+USER rustguac
+ENTRYPOINT ["rustguac", "serve"]
+
 # ---------------------------------------------------------------------------
 # Stage 3: Runtime image
 # ---------------------------------------------------------------------------

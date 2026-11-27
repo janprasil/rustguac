@@ -1,0 +1,68 @@
+services:
+  rustguac:
+    build:
+      context: .
+      target: sso-runtime
+    environment:
+      CF_RDP_SSO: "true"
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:?Set the Cloudflare team URL}
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD:-}
+      CF_ENTRA_TENANT_ID: ${CF_ENTRA_TENANT_ID:?Set the Entra tenant ID}
+      CF_REQUIRED_ROLE: ${CF_REQUIRED_ROLE:?Set the Entra App Role value}
+      AD_LDAPS_URL: ${AD_LDAPS_URL:?Set the LDAPS server URL}
+      AD_BIND_DN: ${AD_BIND_DN:?Set the AD service account DN}
+      AD_BIND_PASSWORD: ${AD_BIND_PASSWORD:?Set the AD service account password}
+      AD_USERS_OU: ${AD_USERS_OU:?Set the dedicated RDP users OU}
+      AD_RDP_GROUP_DN: ${AD_RDP_GROUP_DN:?Set the AD RDP group DN}
+      AD_DOMAIN: ${AD_DOMAIN:?Set the AD DNS domain}
+      AD_CA_CERT_PATH: /run/certs/ad-ca.pem
+      RDP_TARGET_HOST: ${RDP_TARGET_HOST:-}
+      RDP_TARGETS: ${RDP_TARGETS:-}
+      RDP_IGNORE_CERT: ${RDP_IGNORE_CERT:-false}
+      VAULT_ADDR: ${VAULT_ADDR:-http://openbao:8200}
+      VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}
+      VAULT_SECRET_ID: ${VAULT_SECRET_ID:-}
+    restart: unless-stopped
+    volumes:
+      - rustguac-data:/opt/rustguac/data
+      - type: bind
+        source: ${AD_CA_CERT_HOST_PATH:?Mount the AD CA PEM file}
+        target: /run/certs/ad-ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [access, rdp, vault]
+
+  guacd:
+    image: guacamole/guacd:1.6.0
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: info
+    networks: [rdp]
+
+  openbao:
+    image: quay.io/openbao/openbao:2.7.1
+    command: ["server"]
+    restart: unless-stopped
+    volumes:
+      - openbao-data:/openbao/file
+      - ./deploy/rdp-sso/openbao.hcl:/openbao/config/rdp-sso.hcl:ro
+    networks: [vault]
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Set the Cloudflare Tunnel token}
+    restart: unless-stopped
+    networks: [access]
+
+networks:
+  access:
+  rdp:
+  vault:
+    internal: true
+
+volumes:
+  rustguac-data:
+  openbao-data:

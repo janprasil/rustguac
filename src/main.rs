@@ -14,6 +14,7 @@ mod perms;
 mod preconnect;
 mod protocol;
 mod pve;
+mod rdp_sso;
 mod recording;
 mod recording_mp4;
 mod roles;
@@ -1186,13 +1187,30 @@ fn unauthenticated_stateful_routes(manager: Arc<SessionManager>, database: Db) -
         .layer(Extension(database))
 }
 
-async fn run_server(config: Config, database: Db) {
+async fn run_server(mut config: Config, database: Db) {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    let rdp_sso = rdp_sso::RdpSso::from_env().unwrap_or_else(|message| {
+        tracing::error!(%message, "Invalid RDP SSO configuration");
+        std::process::exit(1);
+    });
+    if rdp_sso.is_some() {
+        let Some(vault) = config.vault.as_mut() else {
+            tracing::error!("RDP SSO requires a default [vault] configuration");
+            std::process::exit(1);
+        };
+        if let Ok(addr) = std::env::var("VAULT_ADDR") {
+            vault.addr = addr;
+        }
+        if let Ok(role_id) = std::env::var("VAULT_ROLE_ID") {
+            vault.role_id = role_id;
+        }
+    }
 
     let listen_addr = config.listen_addr.clone();
     let static_path = config.static_path.clone();
@@ -1887,7 +1905,7 @@ async fn run_server(config: Config, database: Db) {
         .layer(Extension(database.clone()));
 
     // Unauthenticated stateful routes
-    let unauth_routes = unauthenticated_stateful_routes(manager, database.clone());
+    let unauth_routes = unauthenticated_stateful_routes(manager.clone(), database.clone());
 
     // Branded HTML page routes (served from memory with site_title/logo baked in)
     let html_routes = Router::new()
@@ -1945,6 +1963,33 @@ async fn run_server(config: Config, database: Db) {
             .layer(Extension(database.clone()));
 
         app = app.merge(oidc_routes).merge(logout_route);
+    }
+
+    if let Some(sso) = rdp_sso {
+        let launch_rate = GovernorConfigBuilder::default()
+            .per_second(2)
+            .burst_size(20)
+            .key_extractor(rate_key)
+            .finish()
+            .expect("Failed to build RDP launch rate limit");
+        let launch = Router::new()
+            .route("/rdp/launch", post(rdp_sso::launch))
+            .with_state(manager.clone())
+            .layer(GovernorLayer::new(launch_rate));
+        app = Router::new()
+            .route("/", get(rdp_sso::index))
+            .route("/connections.html", get(rdp_sso::index))
+            .route("/client/{session_id}", get(serve_client_page))
+            .route("/api/sessions/{id}", get(api::get_session))
+            .route("/ws/{session_id}", get(websocket::ws_handler))
+            .with_state(manager.clone())
+            .merge(launch)
+            .layer(Extension(database.clone()))
+            .layer(Extension(vault_client.default.clone()))
+            .layer(Extension(sso.clone()))
+            .layer(middleware::from_fn_with_state(sso, rdp_sso::authenticate))
+            .route("/api/health", get(api::health))
+            .route("/api/auth/status", get(api::auth_status));
     }
 
     // Add shared layers
