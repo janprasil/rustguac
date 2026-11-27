@@ -27,7 +27,20 @@ Add an entry to `RDP_TARGETS` for every allowed destination. Use the same `publi
 
 After redeploying, open `https://autordp.performance4.cz/?quickConnect`. The page lists configured RDP destinations for this hostname and attempts automatic sign-in when the user selects one. The optional `label` sets the displayed name.
 
-On a connection error, the user can provide their Windows password for that session. This fallback uses the portion of the verified Entra email before `@` as the existing Windows login in `AD_DOMAIN`. It sends the password to the selected RDP server through guacd for NLA. It performs no AD writes and stores no password in Vault.
+## Windows accounts
+
+For an email in `RDP_PRIMARY_EMAIL_DOMAIN` the account name is its login part (`jan.novak@example.com` is `jan.novak`, cut to 20 characters). Other domains are refused unless `RDP_ALLOW_EXTERNAL=true`; their accounts carry the domain (`jan@other.cz` is `jan_other_cz`). A name over 20 characters keeps 13 and gets a hash of the email; the untruncated form is the UPN.
+
+- **No such account:** rustguac creates it in `AD_USERS_OU`, rotates its password and signs in without a prompt.
+- **The account exists:** the user types its password once. rustguac checks it with an LDAPS bind and stores it in OpenBao under the user's Entra identity. If AD later rejects it, the user is asked again. An expired password can be replaced on the desktop list by typing the current and a new one (NLA cannot do this itself). After the first sign-in the page offers to take over the password, except to holders of `RDP_ADMIN_ROLE` and accounts with `adminCount`: rustguac changes it to a random one. This is a password change with the current password, so it needs no extra delegation, and the AD minimum password age applies.
+- **`Administrator`** (by name or RID 500): the password is typed every time. It is never stored or changed.
+- **`Guest`, `krbtgt` and the service account** are refused.
+
+OpenBao therefore holds real user passwords, including those of AD administrators who use the launcher. Protect it and its backups accordingly.
+
+## Admin targets
+
+Set `"admin": true` on a target to list and open it only for users with the `RDP_ADMIN_ROLE` App Role. That role grants access on its own. Their accounts are also added to `AD_RDP_ADMIN_GROUP_DN`; give that group the RDP logon right on the admin hosts. Neither group grants administrative rights. A user who loses the role is removed from the group at their next launch.
 
 The direct link `https://autordp.performance4.cz/?connectTo=10.0.0.1` launches the first desktop automatically. An unconfigured `connectTo` returns 404. If you want the bare URL to launch a default desktop, include one entry for that public hostname without `connect_to`.
 
@@ -52,7 +65,7 @@ For an existing single-server setup, leaving `RDP_TARGETS` empty keeps `RDP_TARG
 - Mount a PEM containing the CA certificates for LDAPS. Set `AD_CA_CERT_HOST_PATH` to the host path readable by the rustguac container.
 - Set `AD_LDAPS_URL`, `AD_BIND_DN`, `AD_BIND_PASSWORD`, `AD_USERS_OU`, `AD_RDP_GROUP_DN`, and `AD_DOMAIN`. Use a writable DC and its certificate hostname in `AD_LDAPS_URL`. Ensure both containers can resolve and reach their respective Windows endpoints. Rustguac connects to LDAPS on 636 and guacd connects to RDP on 3389.
 - Delegate the service account read and user creation rights in the dedicated OU, write access to the attributes rustguac sets, the Reset Password right, and write access to `member` on the chosen RDP group. Grant that group access to the Session Host, including its effective **Allow log on through Remote Desktop Services** policy.
-- Rustguac uses the Entra tenant and object IDs to identify managed AD users. The Windows logon name uses up to seven characters from the email login and a stable suffix. Reserve the OU for these accounts and preserve their CN and ownership marker in `description`. A person with a pre-existing Windows account gets a separate managed account on first access. Rustguac only resets the password for the managed account.
+- rustguac marks accounts it created with the Entra identity in `description`. It resets passwords only for marked accounts inside `AD_USERS_OU`. Delegate write access to `member` on the admin group too.
 - Use the RDP server's certificate hostname and a certificate trusted by guacd. The explicit `RDP_IGNORE_CERT=true` override is available for troubleshooting. If the Session Host authenticates against a different DC, check password replication if the initial NLA login fails.
 
 ## OpenBao
@@ -71,6 +84,7 @@ Set `VAULT_ROLE_ID` and `VAULT_SECRET_ID` in Coolify using the AppRole credentia
 
 ## Pilot verification
 
-- A user without the App Role should get a denial and cause no writes in AD or OpenBao.
-- A user with the role should get a managed AD account and a working Windows session. A new launch after closing all of the user’s desktops should rotate the password. On the same server, overlapping launch requests reuse the pending session or report that the desktop is already open. With two configured hostnames, check that each opens its own target and that a JWT for one hostname is rejected on the other.
+- A user without an App Role should get a denial and cause no writes in AD or OpenBao.
+- A user with the base role sees only the non-admin desktops; a direct link to an admin desktop returns 404.
+- Check one new account, one existing account (password prompt once), the takeover button, and `Administrator` (prompt every time, nothing stored).
 - A provisioning or OpenBao failure should prevent session creation. A subsequent launch retries the setup with a fresh password.

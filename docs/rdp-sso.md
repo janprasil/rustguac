@@ -14,7 +14,7 @@ Set `RDP_TARGETS` to a JSON array:
 
 For a single destination, set `RDP_TARGET_HOST` instead. Set `AD_LDAPS_URL`, `AD_BIND_DN`, `AD_BIND_PASSWORD`, `AD_USERS_OU`, `AD_RDP_GROUP_DN`, `AD_DOMAIN`, and `AD_CA_CERT_PATH`. Use a dedicated AD OU and delegate only account creation, account attributes, password reset and RDP group membership. Grant the configured group RDP access on the target Windows hosts. Keep RDP certificate verification enabled and configure guacd to trust the target certificates.
 
-Set up the existing `[vault]` integration with KV v2 rights scoped to `<mount>/data/rdp-users/*`. The adapter needs create, read and update. The provider-issued stable identity owns the account from the dedicated OU. The email supplies the Windows login for the manual fallback and the prefix for generated logins. The manual fallback uses the password for the current RDP connection.
+Set up the existing `[vault]` integration with KV v2 rights scoped to `<mount>/data/rdp-users/*`. The adapter needs create, read and update. Set `RDP_PRIMARY_EMAIL_DOMAIN`; its users get the login part of the verified email as Windows login. `RDP_ALLOW_EXTERNAL=true` admits other domains. See `deploy/rdp-sso/README.md` for how new, existing and protected accounts and admin targets behave.
 
 ## Identity provider example
 

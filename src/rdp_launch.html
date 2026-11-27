@@ -26,8 +26,20 @@
     <form id="windows-login" method="post" action="/rdp/launch" hidden>
         <label>Windows username <input name="username" autocomplete="username" value="@@USERNAME@@" readonly></label>
         <label>Windows password <input name="password" type="password" autocomplete="current-password" required></label>
+        <div id="new-password" hidden>
+            <label>New password <input name="new_password" type="password" autocomplete="new-password"></label>
+            <label>New password again <input name="repeat" type="password" autocomplete="new-password"></label>
+        </div>
         <button type="submit">Sign in</button>
     </form>
+    <section id="takeover" hidden>
+        <button type="button" id="takeover-start">Let rustguac manage my password</button>
+        <div id="takeover-confirm" hidden>
+            <p>Your Windows password will be replaced with a random one that you will not know. You will not be able to sign in with it to your PC, VPN or file shares. Only an administrator can reset it.</p>
+            <button type="button" id="takeover-yes">Replace my password</button>
+            <button type="button" id="takeover-no">Cancel</button>
+        </div>
+    </section>
 </main>
 <script>
 const statusText = document.getElementById('status');
@@ -35,17 +47,25 @@ const login = document.getElementById('windows-login');
 const desktops = [...document.querySelectorAll('#desktops button')];
 let selected = desktops[0];
 
-async function openDesktop(button, password) {
+const newPassword = document.getElementById('new-password');
+
+function askNewPassword(asking) {
+    newPassword.hidden = !asking;
+    [login.elements.new_password, login.elements.repeat].forEach(input => { input.required = asking; });
+}
+
+async function openDesktop(button, password, replacement) {
     selected = button;
     login.hidden = true;
     desktops.forEach(item => { item.disabled = true; });
     login.querySelector('button').disabled = true;
     statusText.textContent = 'Opening Remote Desktop…';
     try {
-        window.location.replace(await launchRdp(button.dataset.target, password));
+        window.location.replace(await launchRdp(button.dataset.target, password, replacement));
     } catch (error) {
         statusText.textContent = error.message;
         login.hidden = false;
+        askNewPassword(error.prompt === 'new-password');
         desktops.forEach(item => { item.disabled = false; });
         login.querySelector('button').disabled = false;
         login.elements.password.focus();
@@ -56,9 +76,51 @@ desktops.forEach(button => button.addEventListener('click', () => openDesktop(bu
 login.addEventListener('submit', event => {
     event.preventDefault();
     const password = login.elements.password.value;
+    const replacement = newPassword.hidden ? undefined : login.elements.new_password.value;
+    if (replacement !== undefined && replacement !== login.elements.repeat.value) {
+        statusText.textContent = 'The new passwords do not match.';
+        return;
+    }
     login.reset();
-    openDesktop(selected, password);
+    openDesktop(selected, password, replacement);
 });
+
+const takeover = document.getElementById('takeover');
+const takeoverStart = document.getElementById('takeover-start');
+const takeoverConfirm = document.getElementById('takeover-confirm');
+const takeoverYes = document.getElementById('takeover-yes');
+
+function accountUrl(path) {
+    const target = selected && selected.dataset.target;
+    return target ? path + '?connectTo=' + encodeURIComponent(target) : path;
+}
+
+async function refreshTakeover() {
+    if (!selected) return;
+    const response = await fetch(accountUrl('/rdp/account'));
+    takeover.hidden = !(response.ok && (await response.json()).takeover);
+}
+
+function confirmTakeover(asking) {
+    takeoverStart.hidden = asking;
+    takeoverConfirm.hidden = !asking;
+}
+
+takeoverStart.addEventListener('click', () => confirmTakeover(true));
+document.getElementById('takeover-no').addEventListener('click', () => confirmTakeover(false));
+takeoverYes.addEventListener('click', async () => {
+    takeoverYes.disabled = true;
+    const response = await fetch(accountUrl('/rdp/takeover'), {
+        method: 'POST',
+        headers: { 'X-Rustguac-Launch': '1' }
+    });
+    statusText.textContent = await response.text();
+    takeoverYes.disabled = false;
+    confirmTakeover(false);
+    await refreshTakeover();
+});
+
+refreshTakeover().catch(() => {});
 
 if (document.querySelector('main').dataset.autolaunch === 'true') openDesktop(selected);
 </script>

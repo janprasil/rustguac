@@ -14,6 +14,7 @@ mod perms;
 mod preconnect;
 mod protocol;
 mod pve;
+mod rdp_account;
 mod rdp_identity;
 mod rdp_sso;
 mod recording;
@@ -1953,11 +1954,13 @@ async fn run_server(mut config: Config, database: Db) {
             .expect("Failed to build RDP launch rate limit");
         let launch = Router::new()
             .route("/rdp/launch", post(rdp_sso::launch))
+            .route("/rdp/takeover", post(rdp_sso::take_over))
             .with_state(manager.clone())
             .layer(GovernorLayer::new(launch_rate));
         app = Router::new()
             .route("/", get(rdp_sso::index))
             .route("/connections.html", get(rdp_sso::index))
+            .route("/rdp/account", get(rdp_sso::account))
             .route("/client/{session_id}", get(serve_client_page))
             .route("/api/sessions/{id}", get(api::get_session))
             .route("/ws/{session_id}", get(websocket::ws_handler))

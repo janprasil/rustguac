@@ -23,6 +23,8 @@ pub(crate) struct Identity {
     pub email: String,
     pub owner: String,
     pub fingerprint: String,
+    /// Holds the admin role of the identity provider.
+    pub admin: bool,
 }
 
 impl Identity {
@@ -51,18 +53,8 @@ impl Identity {
             email,
             owner,
             fingerprint,
+            admin: false,
         })
-    }
-}
-
-impl Identity {
-    pub fn windows_login(&self) -> Option<&str> {
-        let (login, _) = self.email.split_once('@')?;
-        ((1..=20).contains(&login.len())
-            && login
-                .bytes()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'.' | b'_' | b'-')))
-        .then_some(login)
     }
 }
 
@@ -157,12 +149,5 @@ mod tests {
                 assert_eq!(result.err().unwrap().0, StatusCode::FORBIDDEN);
             }
         }
-    }
-
-    #[test]
-    fn derives_windows_login_from_verified_email() {
-        let identity =
-            Identity::new("jane.doe@example.com".into(), "provider:alice".into()).unwrap();
-        assert_eq!(identity.windows_login(), Some("jane.doe"));
     }
 }

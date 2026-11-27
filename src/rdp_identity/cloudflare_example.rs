@@ -19,6 +19,7 @@ pub(crate) struct CloudflareAccess {
     issuer: String,
     tenant: Uuid,
     role: String,
+    admin_role: Option<String>,
     http: reqwest::Client,
     keys: Mutex<KeyCache>,
 }
@@ -49,7 +50,7 @@ struct EntraClaims {
 }
 
 impl CloudflareAccess {
-    pub fn from_env() -> Result<Self, String> {
+    pub fn from_env(admin_role: Option<String>) -> Result<Self, String> {
         let url = Url::parse(&required("CF_ACCESS_TEAM_DOMAIN")?)
             .map_err(|_| "CF_ACCESS_TEAM_DOMAIN must be an HTTPS origin")?;
         if url.scheme() != "https"
@@ -72,6 +73,7 @@ impl CloudflareAccess {
             issuer,
             tenant,
             role,
+            admin_role,
             http,
             keys: Mutex::new(KeyCache::default()),
         })
@@ -167,22 +169,24 @@ impl CloudflareAccess {
             .map_err(|_| invalid)?
             .claims;
         claims
-            .into_identity(self.tenant, &self.role)
+            .into_identity(self.tenant, &self.role, self.admin_role.as_deref())
             .ok_or(forbidden)
     }
 }
 
 impl Claims {
-    fn into_identity(self, tenant: Uuid, role: &str) -> Option<Identity> {
+    fn into_identity(self, tenant: Uuid, role: &str, admin_role: Option<&str>) -> Option<Identity> {
         let entra = self.custom?;
-        if self.kind != "app"
-            || self.sub.is_empty()
-            || entra.tid != tenant
-            || !entra.roles.iter().any(|value| value == role)
+        let has = |wanted: &str| entra.roles.iter().any(|value| value == wanted);
+        let admin = admin_role.is_some_and(has);
+        // The admin role grants access on its own.
+        if self.kind != "app" || self.sub.is_empty() || entra.tid != tenant || !(admin || has(role))
         {
             return None;
         }
-        Identity::new(self.email, format!("entra:{}:{}", entra.tid, entra.oid))
+        let mut identity = Identity::new(self.email, format!("entra:{}:{}", entra.tid, entra.oid))?;
+        identity.admin = admin;
+        Some(identity)
     }
 }
 
@@ -205,16 +209,29 @@ mod tests {
         let tenant = Uuid::new_v4();
         let oid = Uuid::new_v4();
         assert!(claims("user@example.com", tenant, oid)
-            .into_identity(tenant, "RemoteDesktop")
+            .into_identity(tenant, "RemoteDesktop", None)
             .is_some());
         assert!(claims("user@example.com", tenant, oid)
-            .into_identity(tenant, "Remote")
+            .into_identity(tenant, "Remote", None)
             .is_none());
         assert!(claims("user@example.com", tenant, oid)
-            .into_identity(Uuid::new_v4(), "RemoteDesktop")
+            .into_identity(Uuid::new_v4(), "RemoteDesktop", None)
             .is_none());
         let mut missing = claims("user@example.com", tenant, oid);
         missing.custom = None;
-        assert!(missing.into_identity(tenant, "RemoteDesktop").is_none());
+        assert!(missing
+            .into_identity(tenant, "RemoteDesktop", None)
+            .is_none());
+    }
+
+    #[test]
+    fn admin_role_marks_the_identity_and_grants_access_alone() {
+        let tenant = Uuid::new_v4();
+        let build = |role, admin| {
+            claims("user@example.com", tenant, Uuid::new_v4()).into_identity(tenant, role, admin)
+        };
+        assert!(!build("RemoteDesktop", Some("Admins")).unwrap().admin);
+        assert!(build("Missing", Some("AnotherRole")).unwrap().admin);
+        assert!(build("Missing", Some("Admins")).is_none());
     }
 }

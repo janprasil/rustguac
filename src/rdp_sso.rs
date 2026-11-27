@@ -1,30 +1,27 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::{header, uri::Authority, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::{body::Body, Extension, Json};
-use ldap3::{LdapConnAsync, LdapConnSettings, Mod, Scope, SearchEntry};
-use rand::{seq::SliceRandom, RngExt};
 use serde::Deserialize;
 use tokio::sync::Mutex;
-use url::Url;
 
 use crate::api::{AppState, VaultCell};
 use crate::auth::AuthIdentity;
 use crate::config::OidcConfig;
 use crate::db::Db;
 use crate::perms::{Perm, PermSet};
+use crate::rdp_account::{Directory, Failure};
 #[cfg(feature = "rdp-cloudflare-example")]
 use crate::rdp_identity::cloudflare_example::CloudflareAccess;
 use crate::rdp_identity::{required, Identity, IdentityProvider, NativeOidc};
 use crate::session::{CreateSessionRequest, SessionStatus, SessionType};
 
-const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const PROMPT_HEADER: &str = "x-rustguac-prompt";
 const APP_PAGE: &str = include_str!("rdp_launch.html");
 
 #[derive(Deserialize)]
@@ -35,6 +32,9 @@ struct TargetConfig {
     access_aud: Option<String>,
     connect_to: Option<String>,
     label: Option<String>,
+    /// Listed and opened only for holders of the admin role.
+    #[serde(default)]
+    admin: bool,
 }
 
 struct RdpTarget {
@@ -43,6 +43,13 @@ struct RdpTarget {
     audience: Option<String>,
     connect_to: Option<String>,
     label: String,
+    admin: bool,
+}
+
+impl RdpTarget {
+    fn allows(&self, identity: &Identity) -> bool {
+        !self.admin || identity.admin
+    }
 }
 
 enum Targets {
@@ -73,16 +80,7 @@ pub(crate) struct QuickConnectTargets(Vec<Arc<RdpTarget>>);
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManualLogin {
     password: String,
-}
-
-struct Directory {
-    url: Url,
-    tls: Arc<rustls::ClientConfig>,
-    bind_dn: String,
-    bind_password: String,
-    users_ou: String,
-    rdp_group: String,
-    domain: String,
+    new_password: Option<String>,
 }
 
 pub struct RdpSso {
@@ -111,11 +109,12 @@ impl RdpSso {
             return Ok(None);
         }
         let provider = configured.as_deref().unwrap_or("cloudflare");
+        let admin_role = required("RDP_ADMIN_ROLE").ok();
         let native_oidc = provider == "oidc";
         let identity_provider: Box<dyn IdentityProvider> =
             match provider {
                 #[cfg(feature = "rdp-cloudflare-example")]
-                "cloudflare" => Box::new(CloudflareAccess::from_env()?),
+                "cloudflare" => Box::new(CloudflareAccess::from_env(admin_role.clone())?),
                 #[cfg(not(feature = "rdp-cloudflare-example"))]
                 "cloudflare" => return Err(
                     "Cloudflare authentication requires the rdp-cloudflare-example build feature"
@@ -129,14 +128,29 @@ impl RdpSso {
                 _ => return Err("RDP_IDENTITY_PROVIDER must be cloudflare or oidc".into()),
             };
         let targets = Targets::from_env(!native_oidc)?;
+        let directory = Directory::from_env()?;
+        if targets.has_admin_target()
+            && (native_oidc || admin_role.is_none() || !directory.has_admin_group())
+        {
+            return Err(
+                "Admin targets require the cloudflare provider, RDP_ADMIN_ROLE and AD_RDP_ADMIN_GROUP_DN"
+                    .into(),
+            );
+        }
         Ok(Some(Arc::new(Self {
             identity_provider,
             native_oidc,
-            directory: Directory::from_env()?,
+            directory,
             targets,
             ignore_cert: flag("RDP_IGNORE_CERT")?,
             launch_locks: std::array::from_fn(|_| Mutex::new(())),
         })))
+    }
+
+    async fn lock(&self, identity: &Identity) -> tokio::sync::MutexGuard<'_, ()> {
+        let shard = usize::from_str_radix(&identity.fingerprint[..2], 16).unwrap_or_default()
+            % self.launch_locks.len();
+        self.launch_locks[shard].lock().await
     }
 
     pub fn uses_native_oidc(&self) -> bool {
@@ -152,6 +166,7 @@ impl RdpTarget {
             host,
             audience,
             connect_to: None,
+            admin: false,
         }
     }
 }
@@ -201,6 +216,7 @@ impl Targets {
             let mut target =
                 RdpTarget::new(Some(name.clone()), config.target_host, config.access_aud);
             target.connect_to = config.connect_to;
+            target.admin = config.admin;
             if let Some(label) = config.label {
                 if label.trim().is_empty()
                     || label.chars().count() > 100
@@ -230,6 +246,13 @@ impl Targets {
             }
         }
         Ok(Self::ByHostname(targets))
+    }
+
+    fn has_admin_target(&self) -> bool {
+        match self {
+            Self::Single(target) => target.admin,
+            Self::ByHostname(hosts) => hosts.values().flat_map(HashMap::values).any(|t| t.admin),
+        }
     }
 
     fn for_request(&self, request: &Request) -> Option<&Arc<RdpTarget>> {
@@ -296,226 +319,6 @@ fn valid_dns_hostname(host: &str) -> bool {
         })
 }
 
-impl Directory {
-    fn from_env() -> Result<Self, String> {
-        let url = Url::parse(&required("AD_LDAPS_URL")?).map_err(|_| "AD_LDAPS_URL is invalid")?;
-        if url.scheme() != "ldaps"
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || !matches!(url.path(), "" | "/")
-        {
-            return Err("AD_LDAPS_URL must be an LDAPS server URL".into());
-        }
-        let ca = std::fs::read(required("AD_CA_CERT_PATH")?)
-            .map_err(|_| "Could not read AD_CA_CERT_PATH")?;
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut ca.as_slice()) {
-            roots
-                .add(cert.map_err(|_| "Invalid AD CA certificate")?)
-                .map_err(|_| "Invalid AD CA certificate")?;
-        }
-        if roots.is_empty() {
-            return Err("AD_CA_CERT_PATH contains no CA certificates".into());
-        }
-        let tls = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        Ok(Self {
-            url,
-            tls: Arc::new(tls),
-            bind_dn: required("AD_BIND_DN")?,
-            bind_password: required("AD_BIND_PASSWORD")?,
-            users_ou: required("AD_USERS_OU")?,
-            rdp_group: required("AD_RDP_GROUP_DN")?,
-            domain: required("AD_DOMAIN")?,
-        })
-    }
-
-    async fn rotate_password(
-        &self,
-        identity: &Identity,
-        password: &str,
-    ) -> Result<String, &'static str> {
-        let settings = LdapConnSettings::new()
-            .set_conn_timeout(IO_TIMEOUT)
-            .set_config(self.tls.clone());
-        let (conn, mut ldap) = LdapConnAsync::from_url_with_settings(settings, &self.url)
-            .await
-            .map_err(|_| "LDAPS connection")?;
-        tokio::spawn(async move {
-            let _ = conn.drive().await;
-        });
-        checked(
-            ldap.with_timeout(IO_TIMEOUT)
-                .simple_bind(&self.bind_dn, &self.bind_password)
-                .await,
-            "AD bind",
-        )?;
-
-        let cn = format!("rustguac-{}", &identity.fingerprint[..32]);
-        let dn = format!("CN={cn},{}", self.users_ou);
-        let pending = format!("{}:pending", identity.owner);
-        let attrs = ["description", "sAMAccountName", "userAccountControl"];
-        let result = ldap
-            .with_timeout(IO_TIMEOUT)
-            .search(&dn, Scope::Base, "(objectClass=user)", attrs)
-            .await
-            .map_err(|_| "AD user search")?;
-        let (username, enable) = if result.1.rc == 32 {
-            let username = account_name(identity);
-            let upn = format!("{username}@{}", self.domain);
-            checked(
-                ldap.with_timeout(IO_TIMEOUT)
-                    .add(
-                        &dn,
-                        vec![
-                            ("objectClass", HashSet::from(["user"])),
-                            ("cn", HashSet::from([cn.as_str()])),
-                            ("sAMAccountName", HashSet::from([username.as_str()])),
-                            ("userPrincipalName", HashSet::from([upn.as_str()])),
-                            ("mail", HashSet::from([identity.email.as_str()])),
-                            ("displayName", HashSet::from([identity.email.as_str()])),
-                            ("userAccountControl", HashSet::from(["514"])),
-                            ("description", HashSet::from([pending.as_str()])),
-                        ],
-                    )
-                    .await,
-                "AD user creation",
-            )?;
-            (username, true)
-        } else {
-            let (entries, _) = result.success().map_err(|_| "AD user search")?;
-            let [entry] = entries.as_slice() else {
-                return Err("AD user ownership");
-            };
-            let entry = SearchEntry::construct(entry.clone());
-            let marker = attribute(&entry, "description").ok_or("AD user ownership")?;
-            let enable = marker == pending;
-            if !enable && marker != identity.owner {
-                return Err("AD user ownership");
-            }
-            let username = attribute(&entry, "sAMAccountName")
-                .filter(|name| valid_account_name(name, &identity.fingerprint))
-                .ok_or("AD username")?;
-            let flags = attribute(&entry, "userAccountControl")
-                .and_then(|flags| flags.parse::<u32>().ok())
-                .ok_or("AD account flags")?;
-            if (enable && flags != 514) || (!enable && (flags & 514) != 512) {
-                return Err("AD account disabled or unsuitable");
-            }
-            (username.to_owned(), enable)
-        };
-
-        let group = ldap
-            .with_timeout(IO_TIMEOUT)
-            .modify(
-                &self.rdp_group,
-                vec![Mod::Add("member", HashSet::from([dn.as_str()]))],
-            )
-            .await
-            .map_err(|_| "AD RDP group membership")?;
-        if !matches!(group.rc, 0 | 20) {
-            return Err("AD RDP group membership");
-        }
-        let unicode_password: Vec<u8> = format!("\"{password}\"")
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        checked(
-            ldap.with_timeout(IO_TIMEOUT)
-                .modify(
-                    &dn,
-                    vec![Mod::Replace(
-                        b"unicodePwd".to_vec(),
-                        HashSet::from([unicode_password]),
-                    )],
-                )
-                .await,
-            "AD password rotation",
-        )?;
-        if enable {
-            checked(
-                ldap.with_timeout(IO_TIMEOUT)
-                    .modify(
-                        &dn,
-                        vec![
-                            Mod::Replace("userAccountControl", HashSet::from(["512"])),
-                            Mod::Replace("description", HashSet::from([identity.owner.as_str()])),
-                        ],
-                    )
-                    .await,
-                "AD account activation",
-            )?;
-        }
-        let _ = ldap.with_timeout(IO_TIMEOUT).unbind().await;
-        Ok(username)
-    }
-}
-
-fn checked(
-    result: Result<ldap3::LdapResult, ldap3::LdapError>,
-    step: &'static str,
-) -> Result<(), &'static str> {
-    result
-        .and_then(ldap3::LdapResult::success)
-        .map(|_| ())
-        .map_err(|_| step)
-}
-
-fn attribute<'a>(entry: &'a SearchEntry, name: &str) -> Option<&'a str> {
-    let (_, values) = entry
-        .attrs
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))?;
-    match values.as_slice() {
-        [value] => Some(value.as_str()),
-        _ => None,
-    }
-}
-
-fn account_name(identity: &Identity) -> String {
-    let prefix: String = identity
-        .email
-        .split('@')
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-        .take(7)
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect();
-    format!("{prefix}-{}", &identity.fingerprint[..12])
-}
-
-fn valid_account_name(name: &str, fingerprint: &str) -> bool {
-    (13..=20).contains(&name.len())
-        && name.ends_with(&format!("-{}", &fingerprint[..12]))
-        && name
-            .bytes()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'.' | b'_' | b'-'))
-}
-
-fn generate_password() -> String {
-    let classes: [&[u8]; 4] = [
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-        b"abcdefghijklmnopqrstuvwxyz",
-        b"0123456789",
-        b"!@#%+=_-",
-    ];
-    let all = classes.concat();
-    let mut rng = rand::rng();
-    let mut password: Vec<u8> = classes
-        .iter()
-        .map(|set| set[rng.random_range(0..set.len())])
-        .collect();
-    password.extend((password.len()..24).map(|_| all[rng.random_range(0..all.len())]));
-    password.shuffle(&mut rng);
-    password.into_iter().map(char::from).collect()
-}
-
 pub async fn authenticate(
     State(sso): State<Arc<RdpSso>>,
     mut request: Request,
@@ -568,6 +371,18 @@ pub async fn authenticate(
             return (status, message).into_response();
         }
     };
+    // The menu is filtered per user; a direct link to a hidden target is a 404.
+    let menu = menu.map(|mut menu| {
+        menu.0.retain(|target| target.allows(&identity));
+        menu
+    });
+    if menu.is_none() && !target.allows(&identity) {
+        return (
+            StatusCode::NOT_FOUND,
+            "No Remote Desktop is configured for this address and target.",
+        )
+            .into_response();
+    }
     let authorized = AuthorizedTarget { identity, target };
     request.extensions_mut().insert(AuthIdentity::User {
         email: authorized.session_owner(),
@@ -589,6 +404,7 @@ pub async fn authenticate(
 }
 
 pub(crate) async fn index(
+    Extension(sso): Extension<Arc<RdpSso>>,
     Extension(authorized): Extension<AuthorizedTarget>,
     menu: Option<Extension<QuickConnectTargets>>,
     uri: axum::http::Uri,
@@ -612,7 +428,13 @@ pub(crate) async fn index(
         .replace("@@AUTO@@", if auto { "true" } else { "false" })
         .replace(
             "@@USERNAME@@",
-            &crate::html_escape(authorized.identity.windows_login().unwrap_or_default()),
+            &crate::html_escape(
+                &sso.directory
+                    .naming
+                    .account(&authorized.identity)
+                    .map(|name| name.login)
+                    .unwrap_or_default(),
+            ),
         )
         .replace("@@TARGETS@@", &buttons);
     Html(page)
@@ -626,16 +448,8 @@ pub async fn launch(
     headers: HeaderMap,
     manual: Option<Json<ManualLogin>>,
 ) -> Response {
-    // A cross-origin form cannot supply this header.
-    if headers
-        .get("x-rustguac-launch")
-        .is_none_or(|value| value != "1")
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            "Remote Desktop must be opened from this site.",
-        )
-            .into_response();
+    if let Some(denied) = require_same_site(&headers) {
+        return denied;
     }
     let manual = manual.map(|Json(login)| login);
     // Finish provisioning even if the browser disconnects during the request.
@@ -658,11 +472,15 @@ async fn launch_session(
 ) -> Response {
     let identity = &authorized.identity;
     let session_owner = authorized.session_owner();
-    let shard = usize::from_str_radix(&identity.fingerprint[..2], 16).unwrap_or_default()
-        % sso.launch_locks.len();
-    let _lock = sso.launch_locks[shard].lock().await;
+    let _lock = sso.lock(identity).await;
+    let name = sso
+        .directory
+        .naming
+        .account(identity)
+        .map(|name| name.login)
+        .unwrap_or_default();
 
-    let mut live_username = None;
+    let mut live = false;
     for session in manager.list_sessions().await {
         let (account, _) = session
             .created_by
@@ -690,35 +508,32 @@ async fn launch_session(
                 )
                     .into_response()
             }
-            SessionStatus::Pending | SessionStatus::Active
-                if valid_account_name(&session.username, &identity.fingerprint) =>
-            {
-                live_username = Some(session.username)
+            SessionStatus::Pending | SessionStatus::Active if session.username == name => {
+                live = true
             }
             _ => {}
         }
     }
 
-    let credentials = match manual {
-        Some(login) => {
-            let username = identity
-                .windows_login()
-                .filter(|name| !valid_account_name(name, &identity.fingerprint));
-            match username {
-                Some(username) if !login.password.is_empty() && login.password.len() <= 1024 => {
-                    Ok((username.to_owned(), login.password))
-                }
-                _ => Err((
-                    StatusCode::BAD_REQUEST,
-                    "A valid Windows login and password are required.",
-                )),
-            }
-        }
-        None => automatic_credentials(identity, &sso.directory, &vault, live_username).await,
+    let (typed, new_password) = match manual {
+        Some(login) => (Some(login.password), login.new_password),
+        None => (None, None),
     };
-    let (username, password) = match credentials {
+    if [&typed, &new_password]
+        .into_iter()
+        .flatten()
+        .any(|password| password.is_empty() || password.len() > 1024)
+    {
+        return (StatusCode::BAD_REQUEST, "A Windows password is required.").into_response();
+    }
+    let vault = vault.read().await.clone();
+    let (username, password) = match sso
+        .directory
+        .credentials(identity, vault.as_deref(), typed, new_password, live)
+        .await
+    {
         Ok(credentials) => credentials,
-        Err(error) => return error.into_response(),
+        Err(failure) => return failure_response(failure),
     };
 
     let req = CreateSessionRequest {
@@ -742,52 +557,76 @@ async fn launch_session(
     }
 }
 
-async fn automatic_credentials(
-    identity: &Identity,
-    directory: &Directory,
-    vault: &VaultCell,
-    live_username: Option<String>,
-) -> Result<(String, String), (StatusCode, &'static str)> {
-    let Some(vault) = vault.read().await.clone() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The credential store is temporarily unavailable.",
-        ));
-    };
-    // Keep the password valid while another desktop may still be authenticating.
-    if let Some(username) = live_username {
-        let path = format!("rdp-users/{username}");
-        match vault.read_kv_field(&path, "password").await {
-            Ok(password) => Ok((username, password)),
-            Err(_) => {
-                tracing::warn!("RDP password could not be read for a concurrent session");
-                Err((
-                    StatusCode::BAD_GATEWAY,
-                    "Could not retrieve your Windows credential.",
-                ))
-            }
+fn failure_response(failure: Failure) -> Response {
+    match failure {
+        Failure::NeedPassword(message) => {
+            (StatusCode::CONFLICT, [(PROMPT_HEADER, "password")], message).into_response()
         }
-    } else {
-        let password = generate_password();
-        let username = match directory.rotate_password(identity, &password).await {
-            Ok(username) => username,
-            Err(step) => {
-                tracing::warn!(%step, "RDP account provisioning failed");
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    "Could not prepare your Windows account.",
-                ));
-            }
-        };
-        if vault.put_rdp_password(&username, &password).await.is_err() {
-            tracing::warn!("RDP password could not be stored");
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                "Could not store your Windows credential.",
-            ));
-        }
-        Ok((username, password))
+        Failure::NeedNewPassword(message) => (
+            StatusCode::CONFLICT,
+            [(PROMPT_HEADER, "new-password")],
+            message,
+        )
+            .into_response(),
+        Failure::Refused(status, message) => (status, message).into_response(),
     }
+}
+
+/// Whether to offer the takeover button.
+pub async fn account(
+    Extension(sso): Extension<Arc<RdpSso>>,
+    Extension(vault): Extension<VaultCell>,
+    Extension(authorized): Extension<AuthorizedTarget>,
+) -> Response {
+    let Some(vault) = vault.read().await.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match sso
+        .directory
+        .takeover_available(&authorized.identity, &vault)
+        .await
+    {
+        Ok(takeover) => Json(serde_json::json!({ "takeover": takeover })).into_response(),
+        Err(failure) => failure_response(failure),
+    }
+}
+
+pub async fn take_over(
+    Extension(sso): Extension<Arc<RdpSso>>,
+    Extension(vault): Extension<VaultCell>,
+    Extension(authorized): Extension<AuthorizedTarget>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = require_same_site(&headers) {
+        return denied;
+    }
+    // Finish the password change even if the browser disconnects.
+    let task = tokio::spawn(async move {
+        let _lock = sso.lock(&authorized.identity).await;
+        let Some(vault) = vault.read().await.clone() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        match sso.directory.take_over(&authorized.identity, &vault).await {
+            Ok(()) => "The password is now managed for you.".into_response(),
+            Err(failure) => failure_response(failure),
+        }
+    });
+    task.await
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// A cross-origin form cannot supply this header.
+fn require_same_site(headers: &HeaderMap) -> Option<Response> {
+    headers
+        .get("x-rustguac-launch")
+        .is_none_or(|value| value != "1")
+        .then(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "Remote Desktop must be opened from this site.",
+            )
+                .into_response()
+        })
 }
 
 fn launch_response(mut url: String, target: &RdpTarget) -> Response {
@@ -802,22 +641,6 @@ fn launch_response(mut url: String, target: &RdpTarget) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn account_ownership_survives_email_changes() {
-        let key = "test:alice".to_string();
-        let original = Identity::new("VeryLongLogin@example.com".into(), key.clone()).unwrap();
-        let renamed = Identity::new("different@example.com".into(), key).unwrap();
-        let namesake =
-            Identity::new("VeryLongLogin@example.org".into(), "test:bob".into()).unwrap();
-
-        let username = account_name(&original);
-        assert_eq!(username.len(), 20);
-        assert_eq!(original.owner, renamed.owner);
-        assert!(valid_account_name(&username, &renamed.fingerprint));
-        assert!(!valid_account_name(&username, &namesake.fingerprint));
-        assert_ne!(username, account_name(&namesake));
-    }
 
     const TWO_TARGETS: &str = r#"[
         {"public_host":"rdp-1.example.com","target_host":"windows-1.local","access_aud":"aud-1"},
@@ -901,14 +724,21 @@ mod tests {
     }
 
     #[test]
-    fn generated_passwords_include_all_four_character_classes() {
-        for _ in 0..32 {
-            let password = generate_password();
-            assert_eq!(password.len(), 24);
-            assert!(password.bytes().any(|ch| ch.is_ascii_uppercase()));
-            assert!(password.bytes().any(|ch| ch.is_ascii_lowercase()));
-            assert!(password.bytes().any(|ch| ch.is_ascii_digit()));
-            assert!(password.bytes().any(|ch| ch.is_ascii_punctuation()));
-        }
+    fn admin_targets_are_hidden_from_other_users() {
+        let targets = Targets::parse(
+            r#"[
+                {"public_host":"autordp.example.com","connect_to":"app","target_host":"app-1","access_aud":"aud"},
+                {"public_host":"autordp.example.com","connect_to":"dc","target_host":"dc-1","access_aud":"aud","admin":true}
+            ]"#,
+            true,
+        )
+        .unwrap();
+        assert!(targets.has_admin_target());
+        let menu = targets.menu(&request_for("autordp.example.com")).unwrap();
+        let mut identity = Identity::new("user@example.com".into(), "test:alice".into()).unwrap();
+        let visible = |identity: &Identity| menu.0.iter().filter(|t| t.allows(identity)).count();
+        assert_eq!(visible(&identity), 1);
+        identity.admin = true;
+        assert_eq!(visible(&identity), 2);
     }
 }

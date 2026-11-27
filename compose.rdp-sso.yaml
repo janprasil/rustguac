@@ -11,12 +11,16 @@ services:
       CF_ACCESS_AUD: ${CF_ACCESS_AUD:-}
       CF_ENTRA_TENANT_ID: ${CF_ENTRA_TENANT_ID:?Set the Entra tenant ID}
       CF_REQUIRED_ROLE: ${CF_REQUIRED_ROLE:?Set the Entra App Role value}
+      RDP_ADMIN_ROLE: ${RDP_ADMIN_ROLE:-}
       AD_LDAPS_URL: ${AD_LDAPS_URL:?Set the LDAPS server URL}
       AD_BIND_DN: ${AD_BIND_DN:?Set the AD service account DN}
       AD_BIND_PASSWORD: ${AD_BIND_PASSWORD:?Set the AD service account password}
       AD_USERS_OU: ${AD_USERS_OU:?Set the dedicated RDP users OU}
       AD_RDP_GROUP_DN: ${AD_RDP_GROUP_DN:?Set the AD RDP group DN}
+      AD_RDP_ADMIN_GROUP_DN: ${AD_RDP_ADMIN_GROUP_DN:-}
       AD_DOMAIN: ${AD_DOMAIN:?Set the AD DNS domain}
+      RDP_PRIMARY_EMAIL_DOMAIN: ${RDP_PRIMARY_EMAIL_DOMAIN:?Set the primary email domain}
+      RDP_ALLOW_EXTERNAL: ${RDP_ALLOW_EXTERNAL:-false}
       AD_CA_CERT_PATH: /run/certs/ad-ca.pem
       RDP_TARGET_HOST: ${RDP_TARGET_HOST:-}
       RDP_TARGETS: ${RDP_TARGETS:-}

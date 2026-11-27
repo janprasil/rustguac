@@ -1939,11 +1939,33 @@ impl VaultClient {
         }
     }
 
-    pub async fn put_rdp_password(&self, username: &str, password: &str) -> Result<(), VaultError> {
-        let path = format!("/v1/{}/data/rdp-users/{}", self.mount, username);
-        let body = serde_json::json!({
-            "data": { "password": password, "rotated_at": chrono::Utc::now() }
-        });
+    /// Credential record of one RDP launcher user.
+    pub async fn read_rdp_record(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, VaultError> {
+        let path = format!("/v1/{}/data/rdp-users/{}", self.mount, key);
+        let response = self.request(reqwest::Method::GET, &path, None).await?;
+        match response.status().as_u16() {
+            200 => {
+                let mut json: serde_json::Value = response.json().await?;
+                Ok(Some(json["data"]["data"].take()))
+            }
+            404 => Ok(None),
+            403 => Err(VaultError::Forbidden),
+            status => Err(VaultError::Parse(format!(
+                "RDP credential read failed ({status})"
+            ))),
+        }
+    }
+
+    pub async fn put_rdp_record(
+        &self,
+        key: &str,
+        record: &serde_json::Value,
+    ) -> Result<(), VaultError> {
+        let path = format!("/v1/{}/data/rdp-users/{}", self.mount, key);
+        let body = serde_json::json!({ "data": record });
         let response = self
             .request(reqwest::Method::POST, &path, Some(&body))
             .await?;
@@ -1951,7 +1973,7 @@ impl VaultClient {
             200 | 204 => Ok(()),
             403 => Err(VaultError::Forbidden),
             status => Err(VaultError::Parse(format!(
-                "RDP password write failed ({status})"
+                "RDP credential write failed ({status})"
             ))),
         }
     }
