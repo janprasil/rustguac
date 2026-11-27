@@ -29,6 +29,9 @@ services:
       VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}
       VAULT_SECRET_ID: ${VAULT_SECRET_ID:-}
     restart: unless-stopped
+    # Pins the DC name when DNS also returns an address that must not be used.
+    extra_hosts:
+      - "${AD_HOST_NAME:-ad-dc.invalid}:${AD_HOST_IP:-127.0.0.1}"
     volumes:
       - rustguac-data:/opt/rustguac/data
       - type: bind

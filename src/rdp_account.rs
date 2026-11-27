@@ -663,6 +663,8 @@ impl Directory {
         let dn = format!("CN={name},{}", self.users_ou);
         let upn = format!("{}@{}", account_name.full, self.domain);
         let pending = format!("{}:pending", identity.owner);
+        // No `mail`: directory sync could match it to the cloud user and
+        // overwrite that user's cloud password.
         ldap.with_timeout(IO_TIMEOUT)
             .add(
                 &dn,
@@ -671,7 +673,6 @@ impl Directory {
                     ("cn", HashSet::from([name])),
                     ("sAMAccountName", HashSet::from([name])),
                     ("userPrincipalName", HashSet::from([upn.as_str()])),
-                    ("mail", HashSet::from([identity.email.as_str()])),
                     ("displayName", HashSet::from([identity.email.as_str()])),
                     ("userAccountControl", HashSet::from(["514"])),
                     ("description", HashSet::from([pending.as_str()])),

@@ -62,6 +62,8 @@ For an existing single-server setup, leaving `RDP_TARGETS` empty keeps `RDP_TARG
 
 ## Active Directory and RDP
 
+- **Exclude `AD_USERS_OU` from Entra Connect Sync and Cloud Sync before the first launch.** The accounts there get random passwords and must not reach the cloud. Taking over the password of a synchronized existing account also changes its cloud password.
+- If DNS returns several addresses for the DC, set `AD_HOST_NAME` (the name in `AD_LDAPS_URL`) and `AD_HOST_IP` to pin it inside the container.
 - Mount a PEM containing the CA certificates for LDAPS. Set `AD_CA_CERT_HOST_PATH` to the host path readable by the rustguac container.
 - Set `AD_LDAPS_URL`, `AD_BIND_DN`, `AD_BIND_PASSWORD`, `AD_USERS_OU`, `AD_RDP_GROUP_DN`, and `AD_DOMAIN`. Use a writable DC and its certificate hostname in `AD_LDAPS_URL`. Ensure both containers can resolve and reach their respective Windows endpoints. Rustguac connects to LDAPS on 636 and guacd connects to RDP on 3389.
 - Delegate the service account read and user creation rights in the dedicated OU, write access to the attributes rustguac sets, the Reset Password right, and write access to `member` on the chosen RDP group. Grant that group access to the Session Host, including its effective **Allow log on through Remote Desktop Services** policy.
