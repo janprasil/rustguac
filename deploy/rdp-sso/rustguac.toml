@@ -1,0 +1,12 @@
+listen_addr = "0.0.0.0:8080"
+guacd_addr = "guacd:4822"
+static_path = "/opt/rustguac/static"
+db_path = "/opt/rustguac/data/rustguac.db"
+recording_path = "/opt/rustguac/recordings"
+max_sessions_per_user = 1
+# SSO connects only to configured targets.
+rdp_allowed_networks = ["0.0.0.0/0", "::/0"]
+
+[vault]
+addr = "http://openbao:8200"
+mount = "secret"
