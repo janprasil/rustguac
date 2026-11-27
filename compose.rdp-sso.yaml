@@ -54,9 +54,15 @@ services:
     image: quay.io/openbao/openbao:2.7.1
     command: ["server"]
     restart: unless-stopped
+    # Inline: Coolify did not deliver openbao.hcl to the container.
+    environment:
+      BAO_LOCAL_CONFIG: >-
+        {"storage":{"raft":{"path":"/openbao/file","node_id":"rdp-sso"}},
+        "listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},
+        "api_addr":"http://openbao:8200","cluster_addr":"https://openbao:8201",
+        "disable_mlock":true}
     volumes:
       - openbao-data:/openbao/file
-      - ./deploy/rdp-sso/openbao.hcl:/openbao/config/rdp-sso.hcl:ro
     networks: [vault]
 
 networks:
