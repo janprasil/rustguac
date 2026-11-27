@@ -1,77 +1,38 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::{header, uri::Authority, HeaderMap, StatusCode};
 use axum::middleware::Next;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::{body::Body, Extension, Json};
-use jsonwebtoken::{decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, Validation};
 use ldap3::{LdapConnAsync, LdapConnSettings, Mod, Scope, SearchEntry};
 use rand::{seq::SliceRandom, RngExt};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use url::Url;
-use uuid::Uuid;
 
 use crate::api::{AppState, VaultCell};
 use crate::auth::AuthIdentity;
+use crate::config::OidcConfig;
+use crate::db::Db;
 use crate::perms::{Perm, PermSet};
+#[cfg(feature = "rdp-cloudflare-example")]
+use crate::rdp_identity::cloudflare_example::CloudflareAccess;
+use crate::rdp_identity::{required, Identity, IdentityProvider, NativeOidc};
 use crate::session::{CreateSessionRequest, SessionStatus, SessionType};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
-const JWT_HEADER: &str = "cf-access-jwt-assertion";
 const APP_PAGE: &str = include_str!("rdp_launch.html");
-
-struct Access {
-    issuer: String,
-    tenant: Uuid,
-    role: String,
-    http: reqwest::Client,
-    keys: Mutex<KeyCache>,
-}
-
-#[derive(Default)]
-struct KeyCache {
-    keys: Option<JwkSet>,
-    refreshed: Option<Instant>,
-    attempted: Option<Instant>,
-}
-
-#[derive(Deserialize)]
-struct Claims {
-    email: String,
-    sub: String,
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    custom: Option<EntraClaims>,
-}
-
-#[derive(Deserialize)]
-struct EntraClaims {
-    #[serde(default)]
-    roles: Vec<String>,
-    oid: Uuid,
-    tid: Uuid,
-}
-
-#[derive(Clone)]
-pub(crate) struct Identity {
-    email: String,
-    owner: String,
-    fingerprint: String,
-}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TargetConfig {
     public_host: String,
     target_host: String,
-    access_aud: String,
+    access_aud: Option<String>,
     connect_to: Option<String>,
     label: Option<String>,
 }
@@ -79,7 +40,7 @@ struct TargetConfig {
 struct RdpTarget {
     public_host: Option<String>,
     host: String,
-    validation: Validation,
+    audience: Option<String>,
     connect_to: Option<String>,
     label: String,
 }
@@ -114,17 +75,6 @@ pub(crate) struct ManualLogin {
     password: String,
 }
 
-impl Identity {
-    fn windows_login(&self) -> Option<&str> {
-        let (login, _) = self.email.split_once('@')?;
-        ((1..=20).contains(&login.len())
-            && login
-                .bytes()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'.' | b'_' | b'-')))
-        .then_some(login)
-    }
-}
-
 struct Directory {
     url: Url,
     tls: Arc<rustls::ClientConfig>,
@@ -136,18 +86,12 @@ struct Directory {
 }
 
 pub struct RdpSso {
-    access: Access,
+    identity_provider: Box<dyn IdentityProvider>,
+    native_oidc: bool,
     directory: Directory,
     targets: Targets,
     ignore_cert: bool,
     launch_locks: [Mutex<()>; 64],
-}
-
-fn required(name: &str) -> Result<String, String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("{name} is required"))
 }
 
 fn flag(name: &str) -> Result<bool, String> {
@@ -159,80 +103,75 @@ fn flag(name: &str) -> Result<bool, String> {
 }
 
 impl RdpSso {
-    pub fn from_env() -> Result<Option<Arc<Self>>, String> {
-        if !flag("CF_RDP_SSO")? {
+    pub fn from_env(oidc: Option<&OidcConfig>, db: &Db) -> Result<Option<Arc<Self>>, String> {
+        let configured = std::env::var("RDP_IDENTITY_PROVIDER")
+            .ok()
+            .filter(|provider| !provider.is_empty());
+        if configured.is_none() && !flag("CF_RDP_SSO")? {
             return Ok(None);
         }
-
-        let url = Url::parse(&required("CF_ACCESS_TEAM_DOMAIN")?)
-            .map_err(|_| "CF_ACCESS_TEAM_DOMAIN must be an HTTPS origin")?;
-        if url.scheme() != "https"
-            || url.as_str() != format!("{}/", url.origin().ascii_serialization())
-        {
-            return Err("CF_ACCESS_TEAM_DOMAIN must be an HTTPS origin".into());
-        }
-        let issuer = url.origin().ascii_serialization();
-        let tenant = required("CF_ENTRA_TENANT_ID")?
-            .parse()
-            .map_err(|_| "CF_ENTRA_TENANT_ID must be a UUID")?;
-        let role = required("CF_REQUIRED_ROLE")?;
-        let targets = Targets::from_env(&issuer)?;
-        let http = reqwest::Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(IO_TIMEOUT)
-            .build()
-            .map_err(|_| "Could not configure Cloudflare JWKS client")?;
+        let provider = configured.as_deref().unwrap_or("cloudflare");
+        let native_oidc = provider == "oidc";
+        let identity_provider: Box<dyn IdentityProvider> =
+            match provider {
+                #[cfg(feature = "rdp-cloudflare-example")]
+                "cloudflare" => Box::new(CloudflareAccess::from_env()?),
+                #[cfg(not(feature = "rdp-cloudflare-example"))]
+                "cloudflare" => return Err(
+                    "Cloudflare authentication requires the rdp-cloudflare-example build feature"
+                        .into(),
+                ),
+                "oidc" => {
+                    let config =
+                        oidc.ok_or("RDP_IDENTITY_PROVIDER=oidc requires [oidc] configuration")?;
+                    Box::new(NativeOidc::new(db.clone(), config.issuer_url.clone()))
+                }
+                _ => return Err("RDP_IDENTITY_PROVIDER must be cloudflare or oidc".into()),
+            };
+        let targets = Targets::from_env(!native_oidc)?;
         Ok(Some(Arc::new(Self {
-            access: Access {
-                issuer,
-                tenant,
-                role,
-                http,
-                keys: Mutex::new(KeyCache::default()),
-            },
+            identity_provider,
+            native_oidc,
             directory: Directory::from_env()?,
             targets,
             ignore_cert: flag("RDP_IGNORE_CERT")?,
             launch_locks: std::array::from_fn(|_| Mutex::new(())),
         })))
     }
+
+    pub fn uses_native_oidc(&self) -> bool {
+        self.native_oidc
+    }
 }
 
 impl RdpTarget {
-    fn new(public_host: Option<String>, host: String, issuer: &str, audience: &str) -> Self {
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_issuer(&[issuer]);
-        validation.set_audience(&[audience]);
-        validation.set_required_spec_claims(&["aud", "iss", "exp", "sub"]);
-        validation.validate_nbf = true;
-        validation.leeway = 0;
+    fn new(public_host: Option<String>, host: String, audience: Option<String>) -> Self {
         Self {
             public_host,
             label: host.clone(),
             host,
-            validation,
+            audience,
             connect_to: None,
         }
     }
 }
 
 impl Targets {
-    fn from_env(issuer: &str) -> Result<Self, String> {
+    fn from_env(require_audience: bool) -> Result<Self, String> {
         match std::env::var("RDP_TARGETS") {
-            Ok(value) if !value.trim().is_empty() => Self::parse(&value, issuer),
+            Ok(value) if !value.trim().is_empty() => Self::parse(&value, require_audience),
             Ok(_) | Err(std::env::VarError::NotPresent) => {
                 let host = required("RDP_TARGET_HOST")?;
-                let audience = required("CF_ACCESS_AUD")?;
-                Ok(Self::Single(Arc::new(RdpTarget::new(
-                    None, host, issuer, &audience,
-                ))))
+                let audience = require_audience
+                    .then(|| required("CF_ACCESS_AUD"))
+                    .transpose()?;
+                Ok(Self::Single(Arc::new(RdpTarget::new(None, host, audience))))
             }
             Err(_) => Err("RDP_TARGETS must be valid UTF-8".into()),
         }
     }
 
-    fn parse(value: &str, issuer: &str) -> Result<Self, String> {
+    fn parse(value: &str, require_audience: bool) -> Result<Self, String> {
         let configs: Vec<TargetConfig> = serde_json::from_str(value)
             .map_err(|err| format!("RDP_TARGETS must be a JSON array of RDP targets: {err}"))?;
         if configs.is_empty() {
@@ -249,20 +188,18 @@ impl Targets {
                     .connect_to
                     .as_deref()
                     .is_some_and(|name| !valid_rdp_host(name))
-                || config.access_aud.is_empty()
-                || config.access_aud.chars().any(char::is_whitespace)
+                || (require_audience && config.access_aud.is_none())
+                || config.access_aud.as_deref().is_some_and(|audience| {
+                    audience.is_empty() || audience.chars().any(char::is_whitespace)
+                })
             {
                 return Err(format!(
                     "Invalid hostname, target, or audience in RDP_TARGETS entry {}",
                     index + 1
                 ));
             }
-            let mut target = RdpTarget::new(
-                Some(name.clone()),
-                config.target_host,
-                issuer,
-                &config.access_aud,
-            );
+            let mut target =
+                RdpTarget::new(Some(name.clone()), config.target_host, config.access_aud);
             target.connect_to = config.connect_to;
             if let Some(label) = config.label {
                 if label.trim().is_empty()
@@ -277,7 +214,7 @@ impl Targets {
             if by_selector
                 .values()
                 .next()
-                .is_some_and(|existing| existing.validation.aud != target.validation.aud)
+                .is_some_and(|existing| existing.audience != target.audience)
             {
                 return Err(format!(
                     "RDP_TARGETS entries for {name} must use the same access_aud"
@@ -357,116 +294,6 @@ fn valid_dns_hostname(host: &str) -> bool {
                     .bytes()
                     .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-')
         })
-}
-
-impl Access {
-    async fn authenticate(
-        &self,
-        headers: &HeaderMap,
-        validation: &Validation,
-    ) -> Result<Identity, (StatusCode, &'static str)> {
-        let invalid = (
-            StatusCode::UNAUTHORIZED,
-            "A valid Cloudflare Access session is required.",
-        );
-        let forbidden = (
-            StatusCode::FORBIDDEN,
-            "Your Entra account does not have Remote Desktop access.",
-        );
-        let token = headers
-            .get(JWT_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(invalid)?;
-        let jwt = decode_header(token).map_err(|_| invalid)?;
-        let kid = jwt
-            .kid
-            .filter(|_| jwt.alg == Algorithm::RS256)
-            .ok_or(invalid)?;
-
-        let key = {
-            let mut cache = self.keys.lock().await;
-            let fresh = cache
-                .refreshed
-                .is_some_and(|time| time.elapsed() < Duration::from_secs(3600));
-            let known = cache
-                .keys
-                .as_ref()
-                .is_some_and(|keys| keys.find(&kid).is_some());
-            let can_refresh = cache
-                .attempted
-                .is_none_or(|time| time.elapsed() >= Duration::from_secs(10));
-            if (!fresh || !known) && can_refresh {
-                cache.attempted = Some(Instant::now());
-                if let Ok(response) = self
-                    .http
-                    .get(format!("{}/cdn-cgi/access/certs", self.issuer))
-                    .send()
-                    .await
-                {
-                    if let Ok(response) = response.error_for_status() {
-                        if let Ok(keys) = response.json::<JwkSet>().await {
-                            cache.keys = Some(keys);
-                            cache.refreshed = Some(Instant::now());
-                        }
-                    }
-                }
-            }
-            if cache
-                .refreshed
-                .is_none_or(|time| time.elapsed() >= Duration::from_secs(3600))
-            {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Cloudflare Access verification is temporarily unavailable.",
-                ));
-            }
-            let key = cache
-                .keys
-                .as_ref()
-                .and_then(|keys| keys.find(&kid))
-                .ok_or(invalid)?;
-            DecodingKey::try_from(key).map_err(|_| invalid)?
-        };
-
-        let claims = decode::<Claims>(token, &key, validation)
-            .map_err(|_| invalid)?
-            .claims;
-        claims
-            .into_identity(self.tenant, &self.role)
-            .ok_or(forbidden)
-    }
-}
-
-impl Claims {
-    fn into_identity(self, tenant: Uuid, role: &str) -> Option<Identity> {
-        let entra = self.custom?;
-        if self.kind != "app"
-            || self.sub.is_empty()
-            || entra.tid != tenant
-            || !entra.roles.iter().any(|value| value == role)
-        {
-            return None;
-        }
-        let (login, domain) = self.email.split_once('@')?;
-        if login.is_empty()
-            || domain.is_empty()
-            || domain.contains('@')
-            || self.email.len() > 254
-            || self
-                .email
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control())
-        {
-            return None;
-        }
-        let owner = format!("entra:{}:{}", entra.tid, entra.oid);
-        let fingerprint = hex::encode(Sha256::digest(owner.as_bytes()));
-        Some(Identity {
-            email: self.email,
-            owner,
-            fingerprint,
-        })
-    }
 }
 
 impl Directory {
@@ -713,8 +540,8 @@ pub async fn authenticate(
             .into_response();
     };
     let identity = match sso
-        .access
-        .authenticate(request.headers(), &target.validation)
+        .identity_provider
+        .authenticate(request.headers(), target.audience.as_deref())
         .await
     {
         Ok(identity) => identity,
@@ -722,6 +549,20 @@ pub async fn authenticate(
             if request.method() == axum::http::Method::GET
                 && matches!(request.uri().path(), "/" | "/connections.html")
             {
+                if status == StatusCode::UNAUTHORIZED
+                    && sso.uses_native_oidc()
+                    && !query_has(request.uri(), "sso_error")
+                {
+                    let next = request
+                        .uri()
+                        .path_and_query()
+                        .map_or("/", |uri| uri.as_str());
+                    return Redirect::to(&format!(
+                        "/auth/login?next={}",
+                        urlencoding::encode(next)
+                    ))
+                    .into_response();
+                }
                 return (status, Html(format!("<!doctype html><meta charset=utf-8><title>Remote Desktop</title><p>{message}</p>"))).into_response();
             }
             return (status, message).into_response();
@@ -962,47 +803,13 @@ fn launch_response(mut url: String, target: &RdpTarget) -> Response {
 mod tests {
     use super::*;
 
-    fn claims(email: &str, tenant: Uuid, object_id: Uuid) -> Claims {
-        serde_json::from_value(serde_json::json!({
-            "type": "app",
-            "sub": "access-user",
-            "email": email,
-            "custom": { "tid": tenant, "oid": object_id, "roles": ["RemoteDesktop", "AnotherRole"] },
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn only_the_expected_role_and_tenant_grant_access() {
-        let tenant = Uuid::new_v4();
-        let oid = Uuid::new_v4();
-        assert!(claims("user@example.com", tenant, oid)
-            .into_identity(tenant, "RemoteDesktop")
-            .is_some());
-        assert!(claims("user@example.com", tenant, oid)
-            .into_identity(tenant, "Remote")
-            .is_none());
-        assert!(claims("user@example.com", tenant, oid)
-            .into_identity(Uuid::new_v4(), "RemoteDesktop")
-            .is_none());
-        let mut missing = claims("user@example.com", tenant, oid);
-        missing.custom = None;
-        assert!(missing.into_identity(tenant, "RemoteDesktop").is_none());
-    }
-
     #[test]
     fn account_ownership_survives_email_changes() {
-        let tenant = Uuid::new_v4();
-        let oid = Uuid::new_v4();
-        let original = claims("VeryLongLogin@example.com", tenant, oid)
-            .into_identity(tenant, "RemoteDesktop")
-            .unwrap();
-        let renamed = claims("different@example.com", tenant, oid)
-            .into_identity(tenant, "RemoteDesktop")
-            .unwrap();
-        let namesake = claims("VeryLongLogin@example.org", tenant, Uuid::new_v4())
-            .into_identity(tenant, "RemoteDesktop")
-            .unwrap();
+        let key = "test:alice".to_string();
+        let original = Identity::new("VeryLongLogin@example.com".into(), key.clone()).unwrap();
+        let renamed = Identity::new("different@example.com".into(), key).unwrap();
+        let namesake =
+            Identity::new("VeryLongLogin@example.org".into(), "test:bob".into()).unwrap();
 
         let username = account_name(&original);
         assert_eq!(username.len(), 20);
@@ -1026,7 +833,7 @@ mod tests {
 
     #[test]
     fn maps_hostname_to_target_and_access_audience() {
-        let targets = Targets::parse(TWO_TARGETS, "https://access.example.com").unwrap();
+        let targets = Targets::parse(TWO_TARGETS, true).unwrap();
         let first = targets
             .for_request(&request_for("RDP-1.example.com:443"))
             .unwrap();
@@ -1035,8 +842,8 @@ mod tests {
             .unwrap();
         assert_eq!(first.host, "windows-1.local");
         assert_eq!(second.host, "10.0.0.12");
-        assert_eq!(first.validation.aud, Some(HashSet::from(["aud-1".into()])));
-        assert_eq!(second.validation.aud, Some(HashSet::from(["aud-2".into()])));
+        assert_eq!(first.audience.as_deref(), Some("aud-1"));
+        assert_eq!(second.audience.as_deref(), Some("aud-2"));
         assert!(targets
             .for_request(&request_for("unknown.example.com"))
             .is_none());
@@ -1049,7 +856,7 @@ mod tests {
                 {"public_host":"autordp.example.com","connect_to":"10.0.0.1","target_host":"server-1","access_aud":"aud"},
                 {"public_host":"autordp.example.com","connect_to":"10.0.0.2","target_host":"server-2","access_aud":"aud"}
             ]"#,
-            "https://access.example.com",
+            true,
         ).unwrap();
         let lookup = |query| {
             let mut request = request_for("autordp.example.com");
@@ -1067,17 +874,14 @@ mod tests {
     fn rejects_duplicate_public_hostnames_and_url_targets() {
         let duplicate = TWO_TARGETS.replace("rdp-2", "RDP-1");
         let invalid_target = TWO_TARGETS.replace("windows-1.local", "rdp://windows-1.local");
-        assert!(Targets::parse(&duplicate, "https://access.example.com").is_err());
-        assert!(Targets::parse(&invalid_target, "https://access.example.com").is_err());
+        assert!(Targets::parse(&duplicate, true).is_err());
+        assert!(Targets::parse(&invalid_target, true).is_err());
     }
 
     #[test]
     fn session_ownership_is_bound_to_the_public_hostname() {
-        let targets = Targets::parse(TWO_TARGETS, "https://access.example.com").unwrap();
-        let tenant = Uuid::new_v4();
-        let identity = claims("user@example.com", tenant, Uuid::new_v4())
-            .into_identity(tenant, "RemoteDesktop")
-            .unwrap();
+        let targets = Targets::parse(TWO_TARGETS, true).unwrap();
+        let identity = Identity::new("user@example.com".into(), "test:alice".into()).unwrap();
         let first = AuthorizedTarget {
             identity: identity.clone(),
             target: targets

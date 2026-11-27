@@ -14,6 +14,7 @@ mod perms;
 mod preconnect;
 mod protocol;
 mod pve;
+mod rdp_identity;
 mod rdp_sso;
 mod recording;
 mod recording_mp4;
@@ -1195,10 +1196,11 @@ async fn run_server(mut config: Config, database: Db) {
         )
         .init();
 
-    let rdp_sso = rdp_sso::RdpSso::from_env().unwrap_or_else(|message| {
-        tracing::error!(%message, "Invalid RDP SSO configuration");
-        std::process::exit(1);
-    });
+    let rdp_sso =
+        rdp_sso::RdpSso::from_env(config.oidc.as_ref(), &database).unwrap_or_else(|message| {
+            tracing::error!(%message, "Invalid RDP SSO configuration");
+            std::process::exit(1);
+        });
     if rdp_sso.is_some() {
         let Some(vault) = config.vault.as_mut() else {
             tracing::error!("RDP SSO requires a default [vault] configuration");
@@ -1941,35 +1943,12 @@ async fn run_server(mut config: Config, database: Db) {
         .merge(unauth_routes)
         .merge(html_routes);
 
-    // Add OIDC routes if configured (always rate-limited to prevent brute-force)
-    if let Some(ref oidc_st) = oidc_state {
-        // Burst sized for an office of users behind one NAT address
-        // logging in at once (each login is two requests).
-        let auth_rate_conf = GovernorConfigBuilder::default()
-            .per_second(1)
-            .burst_size(20)
-            .key_extractor(rate_key.clone())
-            .finish()
-            .expect("Failed to build auth rate limit config");
-        let oidc_routes = Router::new()
-            .route("/auth/login", get(oidc::login))
-            .route("/auth/callback", get(oidc::callback))
-            .with_state(oidc_st.clone())
-            .layer(Extension(database.clone()))
-            .layer(GovernorLayer::new(auth_rate_conf));
-
-        let logout_route = Router::new()
-            .route("/auth/logout", get(oidc::logout))
-            .layer(Extension(database.clone()));
-
-        app = app.merge(oidc_routes).merge(logout_route);
-    }
-
+    let native_login = rdp_sso.as_ref().is_none_or(|sso| sso.uses_native_oidc());
     if let Some(sso) = rdp_sso {
         let launch_rate = GovernorConfigBuilder::default()
             .per_second(2)
             .burst_size(20)
-            .key_extractor(rate_key)
+            .key_extractor(rate_key.clone())
             .finish()
             .expect("Failed to build RDP launch rate limit");
         let launch = Router::new()
@@ -1990,6 +1969,30 @@ async fn run_server(mut config: Config, database: Db) {
             .layer(middleware::from_fn_with_state(sso, rdp_sso::authenticate))
             .route("/api/health", get(api::health))
             .route("/api/auth/status", get(api::auth_status));
+    }
+
+    // Add OIDC routes if configured (always rate-limited to prevent brute-force)
+    if let Some(oidc_st) = oidc_state.as_ref().filter(|_| native_login) {
+        // Burst sized for an office of users behind one NAT address
+        // logging in at once (each login is two requests).
+        let auth_rate_conf = GovernorConfigBuilder::default()
+            .per_second(1)
+            .burst_size(20)
+            .key_extractor(rate_key.clone())
+            .finish()
+            .expect("Failed to build auth rate limit config");
+        let oidc_routes = Router::new()
+            .route("/auth/login", get(oidc::login))
+            .route("/auth/callback", get(oidc::callback))
+            .with_state(oidc_st.clone())
+            .layer(Extension(database.clone()))
+            .layer(GovernorLayer::new(auth_rate_conf));
+
+        let logout_route = Router::new()
+            .route("/auth/logout", get(oidc::logout))
+            .layer(Extension(database.clone()));
+
+        app = app.merge(oidc_routes).merge(logout_route);
     }
 
     // Add shared layers

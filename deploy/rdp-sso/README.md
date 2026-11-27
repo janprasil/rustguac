@@ -2,11 +2,15 @@
 
 In Coolify, use a Docker Compose resource sourced from this repository and set the Compose file to `compose.rdp-sso.yaml`. Run one rustguac replica so launches and password rotations for each account are serialized. Cloudflare Access signs the user in before the Quick Connect page lists their RDP destinations.
 
+## Existing tunnel
+
+The stack joins an existing Docker network through `RDP_ACCESS_NETWORK`, which defaults to `coolify`. The existing cloudflared connector must be on that network to reach `http://rustguac:8080`. The stack includes no cloudflared service and publishes no host ports.
+
 ## Cloudflare and Entra ID
 
 1. In the Entra app registration used by Cloudflare, define an App Role for Users/Groups and assign it in Enterprise Applications. Use its **Value**, for example `RemoteDesktop`, as `CF_REQUIRED_ROLE`.
 2. Use only the intended Entra tenant as the login provider for the self-hosted Access application. Add `roles`, `oid`, and `tid` to the provider's custom OIDC claims. Check that the **application JWT** delivered to the origin includes them under `custom`. Test with an allowed and a denied test user before enabling access to the Windows host.
-3. Set `TUNNEL_TOKEN`, `CF_ACCESS_TEAM_DOMAIN`, `CF_ENTRA_TENANT_ID`, and `CF_REQUIRED_ROLE` in Coolify. Use the HTTPS team origin as `CF_ACCESS_TEAM_DOMAIN`. Leave public ports and Coolify proxy domains unset for every service in this stack.
+3. Set `CF_ACCESS_TEAM_DOMAIN`, `CF_ENTRA_TENANT_ID`, and `CF_REQUIRED_ROLE` in Coolify. Use the HTTPS team origin as `CF_ACCESS_TEAM_DOMAIN`. Leave public ports and Coolify proxy domains unset for every service in this stack.
 
 ## Use one public address with Quick Connect
 

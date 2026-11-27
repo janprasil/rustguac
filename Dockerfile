@@ -84,7 +84,8 @@ COPY src/ src/
 COPY docs/ docs/
 COPY static/ static/
 
-RUN cargo build --release
+ARG RUSTGUAC_FEATURES=""
+RUN cargo build --release --locked --features "$RUSTGUAC_FEATURES"
 
 # Standalone rustguac for the RDP SSO stack.
 FROM debian:bookworm-slim AS sso-runtime

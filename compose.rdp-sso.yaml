@@ -3,8 +3,10 @@ services:
     build:
       context: .
       target: sso-runtime
+      args:
+        RUSTGUAC_FEATURES: rdp-cloudflare-example
     environment:
-      CF_RDP_SSO: "true"
+      RDP_IDENTITY_PROVIDER: cloudflare
       CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:?Set the Cloudflare team URL}
       CF_ACCESS_AUD: ${CF_ACCESS_AUD:-}
       CF_ENTRA_TENANT_ID: ${CF_ENTRA_TENANT_ID:?Set the Entra tenant ID}
@@ -49,16 +51,10 @@ services:
       - ./deploy/rdp-sso/openbao.hcl:/openbao/config/rdp-sso.hcl:ro
     networks: [vault]
 
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    command: ["tunnel", "--no-autoupdate", "run"]
-    environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Set the Cloudflare Tunnel token}
-    restart: unless-stopped
-    networks: [access]
-
 networks:
   access:
+    external: true
+    name: ${RDP_ACCESS_NETWORK:-coolify}
   rdp:
   vault:
     internal: true
